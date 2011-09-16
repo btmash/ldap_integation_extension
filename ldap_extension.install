@@ -1,0 +1,20 @@
+<?php
+
+// $Id$
+
+/**
+ * @file
+ * ldap extension module installation and upgrade code.
+ */
+
+/**
+ * Implementation of hook_uninstall().
+ */
+function ldap_extension_uninstall() {
+  $ret = array();
+
+  variable_del('ldap_extension_cron_last');
+  variable_del('ldap_extension_time_interval');
+
+  return $ret;
+}

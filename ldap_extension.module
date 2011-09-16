@@ -1,0 +1,224 @@
+<?php
+
+define('LDAP_EXTENSION_TIME_INTERVAL', variable_get('ldap_extension_time_interval', 3600 * 24 * 7));
+
+/**
+ * Implementation of hook_menu().
+ */
+function ldap_extension_menu() {
+  $items = array();
+  $items['user/%user/switch-ldap-server'] = array(
+    'title' => 'Switch LDAP servers',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ldap_extension_switch_ldap_servers', 1),
+    'access callback' => 'ldap_extension_access_ldap_switch',
+    'access arguments' => array(1),
+    'weight' => 10,
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'ldap_extension.pages.inc',
+  );
+  $items['admin/user/ldapsync'] = array(
+    'title' => 'Manual LDAP Sync',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ldap_extension_manual_sync_ldap'),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer users'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'ldap_extension.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implementation of access callback
+ */
+function ldap_extension_access_ldap_switch($account) {
+  $count = db_result(db_query("SELECT COUNT(sid) FROM {ldapauth} WHERE status = 1"));
+  if (!empty($account->ldap_authentified) &&
+      $count > 1 &&
+      user_access('administer users')) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Implementation of hook_cron().
+ */
+function ldap_extension_cron() {
+  $time = time();
+  $last_time = variable_get('ldap_extension_cron_last', 0);
+  if ($time - $last_time > LDAP_EXTENSION_TIME_INTERVAL) {
+    $context = NULL;
+    ldap_extension_sync($context);
+    variable_set('ldap_extension_cron_last', $time);
+  }
+}
+
+/**
+ * Implementation of hook_user().
+ */
+function ldap_extension_user($op, &$edit, &$account, $category = NULL) {
+  if (($op == 'view' || $op == 'form') && !empty($account->ldap_authentified)) {
+    _ldap_extension_sync_user_data_from_ldap($account);
+  }
+}
+
+/**
+ * Synchronize certain user information.
+ */
+function _ldap_extension_sync_user_data_from_ldap(&$account) {
+  $ldap_server = $account->ldap_config;
+  _ldapauth_init($ldap_server);
+  $ldap_info = _ldapauth_user_lookup($account->name);
+  if ($account->ldap_dn !== $ldap_info['dn']) {
+    $account->ldap_dn = $ldap_info['dn'];
+    user_save($account, array('ldap_dn' => $ldap_info['dn']));
+    $account->content[t(LDAPAUTH_PROFILE)]['ldap_dn'] = $account->ldap_dn;
+    drupal_set_message(t('User %user: LDAP Information was updated.', array('%user' => $account->name)));
+  }
+}
+
+/**
+ * Public function for updating user status
+ */
+function ldap_extension_update_user_status($uid) {
+  $context = NULL;
+  _ldap_extension_update_user_status($uid, $context);
+}
+
+/**
+ * Check and update status that a user account is valid.
+ */
+function _ldap_extension_update_user_status($uid, &$context) {
+  if (!empty($context)) {
+    $context['message'] = t('Updating user status...');
+  }
+  $account = user_load(array('uid' => $uid));
+  if ($account->uid && !empty($account->ldap_authentified)) {
+    $ldap_server = _ldapauth_init($account->ldap_config);
+    $ldap_info = _ldapauth_user_lookup($account->name);
+    if (!is_array($ldap_info) || count($ldap_info) <= 0) {
+      user_delete(array(), $account->uid);
+      if (!empty($context)) {
+        drupal_set_message(t("Account %account does not exist on LDAP. It has now been deleted", array('%account' => $account->name)));
+        $context['message'] = t('Deleted account');
+      }
+    }
+    elseif (empty($account->mail)) {
+      $options = array();
+      if (!isset($ldap_info['mail']) ||
+          !is_array($ldap_info['mail']) ||
+          empty($ldap_info['mail'][0])) {
+        $options['status'] = 0;
+        $options['mail'] = 'ldap_account_'. $account->uid .'@'. str_replace(array('ldap://', 'ldaps://'), '', $ldap_server->server);
+        if (!empty($context)) {
+          drupal_set_message(t("Account %account has been disabled due to lack of email address.", array('%account' => $account->name)));
+          $context['message'] = t('Blocked account');
+        }
+      }
+      else {
+        $options['mail'] = $ldap_info['mail'][0];
+      }
+      user_save($account, $options);
+    }
+  }
+}
+
+/* FUNCTIONS DEALING WITH LDAP SYNC MODULE FUNCTIONALITY */
+
+/**
+ * Search through the various servers
+ */
+function ldap_extension_search_ldap($sid) {
+  if (function_exists('set_time_limit')) {
+    @set_time_limit(3600);
+  }
+  
+  $_ldapsync_ldap = _ldapauth_init($sid);
+  $_ldapsync_ldap->connect($_ldapsync_ldap->getOption('binddn'), $_ldapsync_ldap->getOption('bindpw'));
+  $users = array();
+  foreach (explode("\r\n", $_ldapsync_ldap->getOption('basedn')) as $base_dn) {
+    watchdog('ldapsync', 'ldapsync basedn '. $base_dn .'.');
+    if (empty($base_dn)) {
+      continue;
+    }
+    // re-initialize database object each time
+    $ldapresult = array();
+
+    // execute LDAP search
+    $name_attr = $_ldapsync_ldap->getOption('user_attr') ? $_ldapsync_ldap->getOption('user_attr') : LDAPAUTH_DEFAULT_USER_ATTR;
+    $ldapsync_filter = variable_get('ldapsync_filter', 0);
+    $filter = ($ldapsync_filter == "") ? "$name_attr=*" : $ldapsync_filter; // find all users if no filter set
+    $ldapresult = $_ldapsync_ldap->search($base_dn, $filter);  // filter param seems to be causing error: mysqli_fetch_object() expects parameter 1 to be mysqli_result, array given
+    if (!$ldapresult) continue;
+    $user_attr = drupal_strtolower($_ldapsync_ldap->user_attr); 
+    $mail_attr = drupal_strtolower($_ldapsync_ldap->mail_attr);
+    
+    // need to set default mail domain for LDAP users without a mail attribute
+
+    // cycle through results to build array of user information
+    $i=0;
+    foreach ($ldapresult as $entry) {
+      $name = drupal_strtolower($entry[$user_attr][0]);
+      // don't include if no name attribute
+      if (empty($name)) {
+        continue;
+      }
+      // don't include if LDAP account is disabled
+      $status = $entry['useraccountcontrol'][0]; // this only works for Active Directory -- need to update to work for other LDAP directory types
+      if (($status & 2) != 0) {
+        continue;
+      }
+      $i++;
+      $users[] = $name;
+    }
+  }
+  return $users;
+}
+
+function ldap_extension_sync(&$context) {
+  $servers = db_query("SELECT sid FROM {ldapauth} WHERE status = 1 ORDER BY weight ASC, sid ASC");
+  $new_users = 0;
+  while ($server = db_fetch_object($servers)) {
+    $users = ldap_extension_search_ldap($server->sid);
+    foreach ($users as $username) {
+      $new_users += ldap_extension_sync_add_user($username, $server->sid);
+    }
+  }
+  drupal_set_message(t("New Users added: %new_users", array('%new_users' => $new_users)));
+  if (!empty($context) && is_array($context)) {
+    $context['message'] = t('Completed user import from LDAP.  On towards verifying all users');
+  }
+}
+
+function ldap_extension_sync_add_user($username, $sid) {
+  $context = NULL;
+  return _ldap_extension_sync_add_user($username, $sid, $context);
+}
+
+/**
+ * Add a new user from LDAP if the user does not already exist
+ */
+function _ldap_extension_sync_add_user($username, $sid, &$context) {
+  $check = db_result(db_query("SELECT uid FROM {users} WHERE name = '%s'", $username));
+  if (empty($check)) {
+    $ldap_server = _ldapauth_init($sid);
+    $ldap_lookup = _ldapauth_user_lookup($username);
+    $init = $mail = key_exists(($ldap_server->getOption('mail_attr') ? $ldap_server->getOption('mail_attr') : LDAPAUTH_DEFAULT_MAIL_ATTR), $ldap_lookup) ? $ldap_lookup[$ldap_server->getOption('mail_attr')][0] : $name;
+    $account = array(
+      'name' => $username,
+      'mail' => $mail,
+      'pass' => user_password(20),
+      'init' => $init,
+      'status' => 1,
+      'ldap_authentified' => TRUE,
+      'ldap_dn' => $ldap_lookup['dn'],
+      'ldap_config' => $sid,
+      'authname_ldapauth' => $username,
+    );
+    user_save('', $account);
+    return 1;
+  }
+  return 0;
+}

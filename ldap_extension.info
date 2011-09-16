@@ -1,0 +1,6 @@
+; $Id$
+name = "LDAP Auth Extender"
+description = "Provide a way to synchronize data in a better manner"
+core = 6.x
+package = LDAP integration
+dependencies[] = ldapauth
